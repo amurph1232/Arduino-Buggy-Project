@@ -1,0 +1,257 @@
+#include <WiFiS3.h>  
+#include "Info.h"  
+
+const char ssid[] = SECRET_SSID;  
+const char password[] = SECRET_PASS; 
+
+const int LEYE = A2;  
+const int REYE = A1; 
+const int THRESHOLD = 200;  
+
+const int L_MOTOR1 = 6;  
+const int L_MOTOR2 = 4;  
+const int R_MOTOR1 = 11;  
+const int R_MOTOR2 = 10; 
+
+const int RSPEED = 9;  
+const int LSPEED = 5;  
+
+const int L_ENCODER = 2;  
+const int R_ENCODER = 4; 
+
+const int echo_pin = 7;  
+const int trig_pin = 8;  
+ 
+const int MAX_SPEED = 130;
+const int MIN_SPEED = 50;
+//const int TURN_SPEED = 80;  
+
+const int FOLLOW_DISTANCE = 15;  
+const int SWITCH_DISTANCE = 30;  
+const int STOPPING_DISTANCE = 8;  
+
+// PID Parameters
+float Kp = 8;
+float Ki = 3;
+float Kd = 2;
+float integral = 0;
+float lastError = 0;
+
+// Speed & Motion Control
+float targetSpeed = 100;  
+float currentSpeed = 0;
+int controlMode = 0; // 0 = Manual, 1 = Object Following
+int state = -1;
+
+volatile int leftCount = 0;  
+volatile int rightCount = 0;  
+
+const float wheelDiameter = 6.5;
+const float wheelCircumference = 3.14159 * (wheelDiameter/2); 
+
+float TotalDistance = 0.0;
+
+// WiFi Server  
+WiFiServer server(666);  
+
+// Interrupt Service Routines  
+void leftEncoderISR() { leftCount++; }  
+void rightEncoderISR() { rightCount++; }  
+
+void setup() {  
+    Serial.begin(115200);  
+    while (!Serial);  
+
+    pinMode(LEYE, INPUT);  
+    pinMode(REYE, INPUT);  
+    pinMode(R_MOTOR1, OUTPUT);  
+    pinMode(L_MOTOR1, OUTPUT);  
+    pinMode(R_MOTOR2, OUTPUT);  
+    pinMode(L_MOTOR2, OUTPUT);  
+    pinMode(RSPEED, OUTPUT);  
+    pinMode(LSPEED, OUTPUT);  
+    pinMode(trig_pin, OUTPUT);  
+    pinMode(echo_pin, INPUT);  
+    pinMode(L_ENCODER, INPUT);  
+    pinMode(R_ENCODER, INPUT);  
+
+    attachInterrupt(digitalPinToInterrupt(L_ENCODER), leftEncoderISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(R_ENCODER), rightEncoderISR, CHANGE);
+
+    Serial.println("Setting up Access Point...");  
+    int status = WiFi.beginAP(ssid, password);  
+
+    if (status != WL_AP_LISTENING) {  
+        Serial.println("Access Point creation failed!");  
+        while (true);  
+    }  
+
+    Serial.println("Access Point started!");  
+    Serial.print("IP Address: ");  
+    Serial.println(WiFi.localIP());  
+    server.begin();  
+    Serial.println("Server started, waiting for connections...");  
+}  
+
+int detectLine(int pin) {  
+    int sensorValue = analogRead(pin);  
+    return (sensorValue > THRESHOLD) ? 1 : 0;  
+}  
+
+int getDistance() {  
+    digitalWrite(trig_pin, LOW);  
+    delayMicroseconds(2);  
+    digitalWrite(trig_pin, HIGH);  
+    delayMicroseconds(10);  
+    digitalWrite(trig_pin, LOW);  
+    int duration = pulseIn(echo_pin, HIGH);  
+    return duration * 0.034 / 2;  
+}  
+
+float getSpeed() {
+    float speed = (leftCount + rightCount) / 2.0;
+    leftCount = 0;
+    rightCount = 0;
+    return speed;
+}
+
+
+float pidcal(float setpoint, float actual) {
+    float error = setpoint - actual;
+    integral += error;
+    float derivative = error - lastError;
+    lastError = error;
+    
+    float correction = Kp * error + Ki * integral + Kd * derivative;
+    return constrain(correction, MIN_SPEED, MAX_SPEED);
+}
+
+void followObject(int distance) {
+   float error = FOLLOW_DISTANCE - distance;
+    float correction = Kp * error + Ki * integral + Kd * (error - lastError);
+    lastError = error;
+    integral += error;
+
+  if (abs(error) < 2) {
+        error = 0;  // Stop changing speed if close enough
+    }
+
+    float speedFactor = constrain((distance - FOLLOW_DISTANCE) * 0.3, 0.2, 1.0);
+    float newSpeed = constrain(targetSpeed * speedFactor, MIN_SPEED, MAX_SPEED - 20);
+
+    setMotorSpeed(newSpeed);
+}
+
+
+void setMotorSpeed(float pidOutput) {
+    digitalWrite(L_MOTOR1, HIGH);
+    digitalWrite(L_MOTOR2, LOW);
+    digitalWrite(R_MOTOR1, HIGH);
+    digitalWrite(R_MOTOR2, LOW);
+    analogWrite(RSPEED, pidOutput);
+    analogWrite(LSPEED, pidOutput);
+}
+
+void stopMotors() {    
+    digitalWrite(R_MOTOR1, LOW);  
+    digitalWrite(R_MOTOR2, LOW);  
+    digitalWrite(L_MOTOR1, LOW);  
+    digitalWrite(L_MOTOR2, LOW);  
+    analogWrite(RSPEED, 0);  
+    analogWrite(LSPEED, 0);
+}  
+
+void turnLeft() {
+    digitalWrite(R_MOTOR1, HIGH);
+    digitalWrite(R_MOTOR2, LOW);
+    digitalWrite(L_MOTOR1, LOW);
+    digitalWrite(L_MOTOR2, HIGH);
+    analogWrite(RSPEED, pidOutput);
+    analogWrite(LSPEED, MIN_SPEED);
+}
+
+void turnRight() {
+    digitalWrite(R_MOTOR1, LOW);
+    digitalWrite(R_MOTOR2, HIGH);
+    digitalWrite(L_MOTOR1, HIGH);
+    digitalWrite(L_MOTOR2, LOW);
+    analogWrite(RSPEED, MIN_SPEED);
+    analogWrite(LSPEED, pidOutput);
+}
+void loop() {  
+    WiFiClient client = server.available();  
+
+    if (client) {  
+        Serial.println("Client connected!");  
+
+        while (client.connected()) {  
+            if (client.available()) {  
+                String received = client.readStringUntil('\n');  
+                received.trim();  
+                Serial.println("Received: " + received);  
+
+                if (received.equals("START")) {  
+                    Serial.println("Starting Buggy...");  
+                    client.println("Buggy Started");  
+                    state = 1;
+
+                } else if (received.equals("STOP")) {  
+                    Serial.println("Stopping Buggy...");  
+                    stopMotors();  
+                    state = 0;
+                    client.println("Buggy Stopped");  
+                }  
+            }  
+
+            int leftSensor = detectLine(LEYE);  
+            int rightSensor = detectLine(REYE);  
+            int distance = getDistance();  
+            currentSpeed = getSpeed();
+
+            if (state == 1) {
+                if (distance < STOPPING_DISTANCE ) {
+                    stopMotors();
+                    client.println("Obstacle detected too close");
+                    delay(500);
+                } else if (distance <= SWITCH_DISTANCE) {
+                    controlMode = 1;
+                    followObject(distance);  // New function for object following
+                    Serial.println("Following Object...");
+                } else {
+                    controlMode = 0;
+                    float pidOutput = pidcal(targetSpeed, currentSpeed);
+                    setMotorSpeed(pidOutput);
+                }
+
+                // Line following logic (only in manual mode)
+                if (controlMode == 0) {
+                    if (leftSensor == 0 && rightSensor == 0) {
+                        setMotorSpeed(targetSpeed);
+                    } else if (leftSensor == 0 && rightSensor == 1) {
+                        turnLeft();
+                    } else if (leftSensor == 1 && rightSensor == 0) {
+                        turnRight();
+                    } else if (leftSensor == 1 && rightSensor == 1){
+                        Serial.println("Lost the line! Stopping...");
+                        stopMotors();
+                    }
+                }
+            } 
+            
+            if(state == 0) {
+                stopMotors();
+            }
+
+            client.print("Mode: ");
+            client.print(controlMode == 0 ? "Manual" : "Object Following");
+            client.print(" | Target Speed: ");
+            client.print(targetSpeed);
+            client.print(" | Current Speed: ");
+            client.print(currentSpeed);
+            client.print(" | Distance: ");
+            client.println(distance);
+        } 
+    } 
+    client.stop();
+    delay(100);
+}
